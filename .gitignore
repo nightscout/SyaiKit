@@ -1,0 +1,63 @@
+# macOS
+.DS_Store
+
+# Editor / local tooling
+.obsidian/
+.vscode/
+.swift-version
+
+# Xcode
+xcuserdata/
+*.xcuserstate
+*.xcscmblueprint
+*.moved-aside
+**/xcshareddata/WorkspaceSettings.xcsettings
+DerivedData/
+build/
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+# Build artifacts
+*.hmap
+*.ipa
+*.dSYM
+*.dSYM.zip
+
+# Captured Syai secrets — NEVER commit (see Research/tools/syai_replay.py)
+cfg.json
+**/cfg.json
+*.capture.json
+Research/tools/*.local.json
+Research/tools/*.local.db
+# Frida session logs (may contain tokens / sign keys)
+*.log
+syai_*.log
+__pycache__/
+*.pyc
+
+# Extracted Blutter disassembly — regenerate on demand from the LFS tarball
+# (`git lfs pull && tar --zstd -xf Research/asm/syai_1.26.0_blutter_asm.tar.zst`).
+# Only the .tar.zst is tracked (via Git LFS); never commit the ~335 MB extract.
+Research/asm/*
+!Research/asm/syai_1.26.0_blutter_asm.tar.zst
+!Research/asm/syai_1.1.71_blutter_asm.tar.zst
+!Research/asm/syai_1.17.0_blutter_asm.tar.zst
+!Research/asm/syai_1.28.0_blutter_asm.tar.zst
+
+# Go poller build output + runtime state (Research/tools/go/)
+Research/tools/go/syai-poll
+Research/tools/go/syai-poll.state.json
+
+# JetBrains project settings for the Go poller
+Research/tools/go/.idea/
+
+# Real-hardware regression tests (captured coefficients/keys/device secrets).
+# Kept locally for dev, not shipped in the public repo.
+SyaiKitTests/Sensitive/
+
+# Research/ is dev-only and doesn't ship (see CLAUDE.md). The ground-truth
+# decoder fixtures live in SyaiKitTests/Fixtures/ instead.
+Research/
