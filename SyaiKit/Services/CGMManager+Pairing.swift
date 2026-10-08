@@ -18,27 +18,23 @@ public extension SyaiCGMManager {
             try await simulateActivation(mac: preselectedMAC, onStage: onStage)
         #else
         guard let sensorKit, let calibrationProvider else { throw AttachError.notConfigured }
-        let binder = makeServerDeviceBinder()
 
         let service = SyaiPairingService(
             sensorKit: sensorKit,
             calibrationProvider: calibrationProvider,
-            binder: binder
+            binder: makeServerDeviceBinder(),
+            boundSensorLookup: makeBoundSensorLookup()
         )
         do {
+            let pendingBind = state.sensors.pendingBind
             let outcome = try await service.activate(
                 preselectedIdentity: preselectedMAC.map { SyaiSensorIdentity(mac: $0) },
-                pendingProvisioning: { [weak self] mac in
-                    guard let record = self?.state.sensors.pendingActivation(forMAC: mac) else { return nil }
-                    return SyaiProvisioning(deviceInfo: record.deviceInfo, keyGroup: record.keyGroup)
-                },
-                onProvisioningResolved: { [weak self] provisioning in
-                    guard let keyGroup = provisioning.keyGroup else { return }
-                    let record = SyaiSensorRecord(deviceInfo: provisioning.deviceInfo, keyGroup: keyGroup)
+                pendingBind: { mac in pendingBind?.mac == mac ? pendingBind : nil },
+                onActivated: { [weak self] pending in
                     Task { @MainActor in
                         guard let self else { return }
                         var updated = self.state
-                        updated.sensors.setPendingActivation(record)
+                        updated.sensors.setPendingBind(pending)
                         self.setState(updated)
                     }
                 },

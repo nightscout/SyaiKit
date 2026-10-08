@@ -304,7 +304,7 @@ final class SyaiEnvelopedClientTests: XCTestCase {
         }
     }
 
-    /// `productModel` rides `validateDeviceByMacV2` and nothing else, so it is opt-in.
+    /// `productModel` rides only `validateDeviceByMacV3`, `cgmAuth/verify` and `authInfo`, so it is opt-in.
     /// This asserts the default direction — a new call site gets no `productModel`
     /// unless it asks, rather than leaking one by inheriting a permissive default.
     func testProductModelIsOptInPerCall() async throws {
@@ -329,6 +329,15 @@ final class SyaiEnvelopedClientTests: XCTestCase {
         _ = try await client.validateMac("112233445566")
         let validate = try XCTUnwrap(StubURLProtocol.requests.last)
         XCTAssertEqual((validate.request.allHTTPHeaderFields ?? [:])["productModel"], "X1")
+        XCTAssertTrue(validate.request.url!.path.hasSuffix("device/validateDeviceByMacV3"), validate.request.url!.path)
+        XCTAssertEqual(validate.request.httpMethod, "POST", "V3 is a POST; the retired V2 was a GET")
+
+        _ = try await client.verifyCgmAuth(mac: "112233445566", authDev: Data([0xAB]), authFlag: Data([0xCD]))
+        let verify = try XCTUnwrap(StubURLProtocol.requests.last)
+        XCTAssertTrue(verify.request.url!.path.hasSuffix("cgmAuth/verify"), verify.request.url!.path)
+        XCTAssertEqual((verify.request.allHTTPHeaderFields ?? [:])["productModel"], "X1")
+        let timestamp = try XCTUnwrap((verify.request.allHTTPHeaderFields ?? [:])["timestamp"])
+        XCTAssertEqual(timestamp.count, 13, "cgmAuth/verify signs a millisecond timestamp")
     }
 
     /// `user/apiToken` and `user/mail/login` are unauthenticated; a stale access token

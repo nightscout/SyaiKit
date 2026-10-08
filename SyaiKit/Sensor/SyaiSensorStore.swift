@@ -91,11 +91,12 @@ public struct SyaiSensorStore: Equatable, Sendable, RawRepresentable {
     public private(set) var records: [SyaiSensorRecord]
     public var activeMAC: String?
 
-    /// Crash/interrupt insurance for the activation one-way door: the fetched
-    /// record is persisted before the first write, since coefficients become
-    /// unfetchable once activation writes land. Never cleared on activation
-    /// failure, because a failed run may still have completed some writes.
-    public private(set) var pendingActivation: SyaiSensorRecord?
+    /// Crash/interrupt insurance for the window between activation and bind:
+    /// the sensor's keys only arrive with the bind, so a sensor activated but
+    /// not yet bound can't be read. Set as soon as the activate command lands;
+    /// the next pairing attempt for that MAC resumes at the bind instead of
+    /// activating again. Cleared once the sensor is adopted.
+    public private(set) var pendingBind: SyaiPendingBind?
 
     /// How many retired sensors to keep for diagnostics before trimming the
     /// oldest. The active record never counts against being dropped.
@@ -104,11 +105,11 @@ public struct SyaiSensorStore: Equatable, Sendable, RawRepresentable {
     public init(
         records: [SyaiSensorRecord] = [],
         activeMAC: String? = nil,
-        pendingActivation: SyaiSensorRecord? = nil
+        pendingBind: SyaiPendingBind? = nil
     ) {
         self.records = records
         self.activeMAC = activeMAC
-        self.pendingActivation = pendingActivation
+        self.pendingBind = pendingBind
     }
 
     public func current() -> SyaiSensorRecord? {
@@ -118,12 +119,12 @@ public struct SyaiSensorStore: Equatable, Sendable, RawRepresentable {
 
     public func history() -> [SyaiSensorRecord] { records }
 
-    public mutating func setPendingActivation(_ record: SyaiSensorRecord) {
-        pendingActivation = record
+    public mutating func setPendingBind(_ pending: SyaiPendingBind) {
+        pendingBind = pending
     }
 
-    public func pendingActivation(forMAC mac: String) -> SyaiSensorRecord? {
-        pendingActivation?.mac == mac ? pendingActivation : nil
+    public func pendingBind(forMAC mac: String) -> SyaiPendingBind? {
+        pendingBind?.mac == mac ? pendingBind : nil
     }
 
     /// Adopt `deviceInfo` as the active sensor, retiring whatever was active.
@@ -151,7 +152,7 @@ public struct SyaiSensorStore: Equatable, Sendable, RawRepresentable {
         )
         records.insert(record, at: 0)
         activeMAC = deviceInfo.mac
-        if pendingActivation?.mac == deviceInfo.mac { pendingActivation = nil }
+        if pendingBind?.mac == deviceInfo.mac { pendingBind = nil }
         trim()
     }
 
@@ -248,19 +249,47 @@ public struct SyaiSensorStore: Equatable, Sendable, RawRepresentable {
         records = []
         activeMAC = rawValue["activeMAC"] as? String
         // additive: absent key means nil (state persisted before the slot existed)
-        pendingActivation = (rawValue["pendingActivation"] as? [String: Any])
-            .flatMap(SyaiSensorRecord.init(rawValue:))
+        pendingBind = (rawValue["pendingBind"] as? [String: Any])
+            .flatMap(SyaiPendingBind.init(rawValue:))
     }
 
     public var rawValue: RawValue {
         // `records` is deliberately not written here: it lives only in
         // `SyaiSensorHistoryStore`'s file now (see `mergeHistory`), so
-        // rawState carries just the index - `activeMAC` - plus in-flight
-        // activation insurance. Avoids storing the same coefficients/BLE
+        // rawState carries just the index - `activeMAC` - plus the in-flight
+        // pending-bind marker. Avoids storing the same coefficients/BLE
         // keys in two plists.
         var raw: RawValue = [:]
         raw["activeMAC"] = activeMAC
-        raw["pendingActivation"] = pendingActivation?.rawValue
+        raw["pendingBind"] = pendingBind?.rawValue
         return raw
+    }
+}
+
+/// A sensor this app activated whose bind hasn't completed yet.
+public struct SyaiPendingBind: Equatable, Sendable, RawRepresentable {
+    public let mac: String
+    public let deviceVersion: String
+    public let activatedAt: Date
+
+    public init(mac: String, deviceVersion: String, activatedAt: Date) {
+        self.mac = mac
+        self.deviceVersion = deviceVersion
+        self.activatedAt = activatedAt
+    }
+
+    public typealias RawValue = [String: Any]
+
+    public init?(rawValue: RawValue) {
+        guard let mac = rawValue["mac"] as? String,
+              let activatedAt = rawValue["activatedAt"] as? Date
+        else { return nil }
+        self.mac = mac
+        deviceVersion = rawValue["deviceVersion"] as? String ?? ""
+        self.activatedAt = activatedAt
+    }
+
+    public var rawValue: RawValue {
+        ["mac": mac, "deviceVersion": deviceVersion, "activatedAt": activatedAt]
     }
 }

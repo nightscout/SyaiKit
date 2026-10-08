@@ -234,44 +234,41 @@ final class SyaiSensorStoreTests: XCTestCase {
         XCTAssertEqual(store.history().first?.methodBlob, "QUJD", "no active record ⇒ no write")
     }
 
-    func testSetPendingActivationLookupAndReplace() {
-        var store = SyaiSensorStore()
-        XCTAssertNil(store.pendingActivation)
-        XCTAssertNil(store.pendingActivation(forMAC: "AAA"))
-
-        let record = SyaiSensorRecord(deviceInfo: makeDevice(mac: "AAA"), keyGroup: makeKeys("AAA"))
-        store.setPendingActivation(record)
-        XCTAssertEqual(store.pendingActivation, record)
-        XCTAssertEqual(store.pendingActivation(forMAC: "AAA"), record)
-        XCTAssertNil(store.pendingActivation(forMAC: "BBB"), "MAC-gated lookup")
-
-        let replacement = SyaiSensorRecord(deviceInfo: makeDevice(mac: "BBB"), keyGroup: makeKeys("BBB"))
-        store.setPendingActivation(replacement)
-        XCTAssertEqual(store.pendingActivation, replacement, "next pairing's fetch replaces")
-        XCTAssertNil(store.pendingActivation(forMAC: "AAA"))
+    private func makePending(_ mac: String) -> SyaiPendingBind {
+        SyaiPendingBind(mac: mac, deviceVersion: "V1.7.SH22601.3", activatedAt: Date(timeIntervalSince1970: 1_791_400_000))
     }
 
-    /// A successful adopt of the pending MAC discharges the insurance — the
-    /// record is now active, coefficients and all. A failure never clears it.
-    func testAdoptClearsMatchingPendingActivation() {
+    func testSetPendingBindLookupAndReplace() {
         var store = SyaiSensorStore()
-        store.setPendingActivation(
-            SyaiSensorRecord(deviceInfo: makeDevice(mac: "AAA"), keyGroup: makeKeys("AAA"))
-        )
+        XCTAssertNil(store.pendingBind)
+        XCTAssertNil(store.pendingBind(forMAC: "AAA"))
+
+        store.setPendingBind(makePending("AAA"))
+        XCTAssertEqual(store.pendingBind, makePending("AAA"))
+        XCTAssertEqual(store.pendingBind(forMAC: "AAA"), makePending("AAA"))
+        XCTAssertNil(store.pendingBind(forMAC: "BBB"), "MAC-gated lookup")
+
+        store.setPendingBind(makePending("BBB"))
+        XCTAssertEqual(store.pendingBind, makePending("BBB"), "the next activation replaces it")
+        XCTAssertNil(store.pendingBind(forMAC: "AAA"))
+    }
+
+    /// Adopting the pending MAC means its bind completed: the marker is discharged.
+    func testAdoptClearsMatchingPendingBind() {
+        var store = SyaiSensorStore()
+        store.setPendingBind(makePending("AAA"))
         store.adopt(makeDevice(mac: "AAA"), keyGroup: makeKeys("AAA"), peripheralID: nil, activatedAt: nil)
-        XCTAssertNil(store.pendingActivation)
+        XCTAssertNil(store.pendingBind)
         XCTAssertEqual(store.activeMAC, "AAA")
     }
 
-    /// Adopting a different MAC leaves the pending record parked — the failed
-    /// run's coefficients stay recoverable.
-    func testAdoptOfOtherMACKeepsPendingActivation() {
+    /// Adopting a different MAC leaves the marker parked, so the activated
+    /// sensor can still be bound later.
+    func testAdoptOfOtherMACKeepsPendingBind() {
         var store = SyaiSensorStore()
-        store.setPendingActivation(
-            SyaiSensorRecord(deviceInfo: makeDevice(mac: "AAA"), keyGroup: makeKeys("AAA"))
-        )
+        store.setPendingBind(makePending("AAA"))
         store.adopt(makeDevice(mac: "BBB"), keyGroup: makeKeys("BBB"), peripheralID: nil, activatedAt: nil)
-        XCTAssertEqual(store.pendingActivation(forMAC: "AAA")?.mac, "AAA")
+        XCTAssertEqual(store.pendingBind(forMAC: "AAA"), makePending("AAA"))
     }
 
     /// `mergeHistory` backs `SyaiSensorHistoryStore`'s file-mirror fold-in on
@@ -379,18 +376,16 @@ final class SyaiSensorStoreTests: XCTestCase {
         XCTAssertEqual(store.activeMAC, "LIVE")
     }
 
-    /// The pending record round-trips through rawState, and state persisted
-    /// before the slot existed decodes it as nil.
-    func testPendingActivationRawStateRoundTrip() throws {
+    /// The pending-bind marker round-trips through rawState, and state
+    /// persisted without the slot decodes it as nil.
+    func testPendingBindRawStateRoundTrip() throws {
         var store = SyaiSensorStore()
         XCTAssertNil(
-            SyaiSensorStore(rawValue: store.rawValue)?.pendingActivation,
-            "legacy rawValue (no key) decodes nil"
+            SyaiSensorStore(rawValue: store.rawValue)?.pendingBind,
+            "rawValue without the key decodes nil"
         )
 
-        store.setPendingActivation(
-            SyaiSensorRecord(deviceInfo: makeDevice(mac: "AAA"), keyGroup: makeKeys("AAA"))
-        )
+        store.setPendingBind(makePending("AAA"))
         let data = try PropertyListSerialization.data(
             fromPropertyList: store.rawValue, format: .binary, options: 0
         )
@@ -398,7 +393,7 @@ final class SyaiSensorStoreTests: XCTestCase {
             PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
         )
         let restored = try XCTUnwrap(SyaiSensorStore(rawValue: raw))
-        XCTAssertEqual(restored.pendingActivation, store.pendingActivation)
+        XCTAssertEqual(restored.pendingBind, store.pendingBind)
         XCTAssertEqual(restored, store)
     }
 }

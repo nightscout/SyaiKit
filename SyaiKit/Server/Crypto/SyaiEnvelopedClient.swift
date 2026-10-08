@@ -153,9 +153,11 @@ public actor SyaiEnvelopedClient {
     static func classify(_ key: String) -> Redaction {
         let k = key.lowercased()
         // Secret key material, password-equivalents (login `signature` is an MD5 over
-        // the password), and the per-sensor BLE key group / calibration.
+        // the password), the per-sensor BLE key group / calibration, and the
+        // server-built auth answer and frames from `cgmAuth/verify`.
         if k.contains("secret") || k.contains("signature") || k.contains("password")
             || k.contains("encryptinfo") || k == "keya" || k == "coefficient" || k == "apitoken"
+            || k == "auth" || k == "shainfo" || k == "cf" || k == "kb"
         {
             return .full
         }

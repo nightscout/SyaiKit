@@ -8,7 +8,7 @@
 
 import Foundation
 
-/// Deciphers the `coefficient` field of a `validateDeviceByMacV2` response into C0..C13.
+/// Deciphers the `coefficient` field of a sensor record (bind / getBindDevice response) into C0..C13.
 ///
 /// Wire format:
 /// ```

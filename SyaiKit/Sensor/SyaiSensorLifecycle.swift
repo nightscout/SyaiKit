@@ -67,7 +67,7 @@ public enum SyaiSensorLifecycle: Equatable {
              nil: break
         }
         // `activatedAt`/`activeDuration`/`preheatDuration` all come from the same
-        // server-fetched DeviceInfo record — a bound sensor's validateDeviceByMacV2
+        // server-fetched DeviceInfo record — a bound sensor's record
         // always returns real durations, so they're present or absent together. No
         // placeholder default: a missing duration means the lifecycle isn't known
         // yet, not that a generic 14-day/30-min guess applies.

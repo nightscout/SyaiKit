@@ -10,24 +10,9 @@ import CryptoKit
 @testable import SyaiKit
 import XCTest
 
-/// Covers the offline branches of the account-backed device binder. The live
-/// `deviceBind/composite/bind` request is LIVE-VERIFY (no request to api.syai.com
-/// has been made yet), so these tests exercise only the two paths that short-
-/// circuit *before* any network call: the not-configured guard and the empty
-/// `deviceVersion` skip.
+/// Covers the account-backed device binder through a stubbed `URLProtocol`:
+/// no request ever leaves the machine.
 final class SyaiServerDeviceBinderTests: XCTestCase {
-    private func deviceInfo(deviceVersion: String) -> DeviceInfo {
-        DeviceInfo(
-            mac: "665544332211",
-            serialNo: "", batchNo: "", deviceType: "cgm",
-            deviceVersion: deviceVersion,
-            coefficients: Array(repeating: 0, count: 14),
-            k: 1, b: 0,
-            produceTime: Date(timeIntervalSince1970: 0),
-            activeDuration: 14 * 24 * 3600, preheatDuration: 1800
-        )
-    }
-
     /// A logged-out (template) backend has no refresh token, so bind must throw
     /// `notConfigured` without touching the network.
     func testBindThrowsWhenNotConfigured() async {
@@ -35,7 +20,7 @@ final class SyaiServerDeviceBinderTests: XCTestCase {
         do {
             _ = try await binder.bind(
                 mac: "665544332211",
-                deviceInfo: deviceInfo(deviceVersion: "X1"),
+                deviceVersion: "V1.7.SH22601.3",
                 activatedAt: Date()
             )
             XCTFail("expected notConfigured to throw")
@@ -46,20 +31,39 @@ final class SyaiServerDeviceBinderTests: XCTestCase {
         }
     }
 
-    /// A configured session but an empty `deviceVersion` (the server would reject it
-    /// as HardwareVersion_NotNull) returns the skip sentinel and fires no request.
-    func testBindSkipsWhenDeviceVersionEmpty() async throws {
+    /// The bind goes to `composite/bindV3` as an enveloped POST, and the
+    /// device record in the reply is kept for the key/coefficient parse.
+    func testBindPostsToBindV3AndKeepsTheDeviceRecord() async throws {
+        BinderStubURLProtocol.reset()
+        defer { BinderStubURLProtocol.reset() }
+        let handshake = Self.handshakeResponse()
+        BinderStubURLProtocol.handler = { request, _ in
+            if request.url!.path.hasSuffix("security/exchangeKey") {
+                return (200, handshake)
+            }
+            return (200, try! JSONSerialization.data(withJSONObject: [
+                "code": "OK",
+                "data": ["cgmDeviceRespVO": ["mac": "665544332211", "method": "QUJD", "methodId": 7]]
+            ]))
+        }
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [BinderStubURLProtocol.self]
         let configured = SyaiBackend.syaiTemplate.withCredentials(
-            SyaiCredentials(refreshToken: "r.token", accessToken: "a.token")
+            SyaiCredentials(
+                refreshToken: Self.jwt(expiresIn: 86400),
+                accessToken: Self.jwt(expiresIn: 1200)
+            )
         )
-        let binder = SyaiServerDeviceBinder(backend: configured)
-        let result = try await binder.bind(
-            mac: "665544332211",
-            deviceInfo: deviceInfo(deviceVersion: ""),
-            activatedAt: Date()
-        )
-        XCTAssertEqual(result.code, "SKIPPED_NO_VERSION")
-        XCTAssertNil(result.methodBlob)
+        let binder = SyaiServerDeviceBinder(backend: configured, session: URLSession(configuration: config))
+
+        let result = try await binder.bind(mac: "665544332211", deviceVersion: "V1.7.SH22601.3", activatedAt: Date())
+
+        let sent = try XCTUnwrap(BinderStubURLProtocol.requests.last)
+        XCTAssertTrue(sent.request.url!.path.hasSuffix("deviceBind/composite/bindV3"), sent.request.url!.path)
+        XCTAssertEqual(sent.request.httpMethod, "POST")
+        XCTAssertTrue(result.isSuccess)
+        XCTAssertEqual(result.methodBlob, "QUJD", "the V3 record carries the method inline")
+        XCTAssertNotNil(result.deviceRecord)
     }
 
     /// `markDeviceStatus` on a logged-out (template) backend throws

@@ -10,13 +10,12 @@ import CoreBluetooth
 @testable import SyaiKit
 import XCTest
 
-/// Pins the activation write **set and order**. The write sequence is:
+/// Pins the activation write **set and order**. The server builds and encrypts
+/// the frames (`cgmAuth/verify`); this side writes them verbatim, in order:
 ///
-///     writeCoefficientList → writeActiveDuration → writeRTC(0) → activate cmd
+///     coefficient (ctlDevice) → duration (activeDuration) → RTC(0) → activate (cmd)
 ///
-/// The app calls `_setCalibrationParameterIfNeed` and declines, so the sequence
-/// notably **never** writes calibration parameters. These tests exist because
-/// activation is a one-shot, irreversible operation on real hardware: a wrong
+/// Activation is a one-shot, irreversible operation on real hardware: a wrong
 /// write set can only be observed on the actual sensor, so it is locked down here.
 final class SyaiActivationSequenceTests: XCTestCase {
     /// Records every GATT op in order. `cmdStateOnRead` drives the `readCmd` freshness
@@ -33,6 +32,8 @@ final class SyaiActivationSequenceTests: XCTestCase {
         var cmdStateOnRead: Int = 0
         var cmdReadPayload: Data?
         var readError: Error?
+        /// Fail the write to this characteristic, as a dropped link would.
+        var failWriteTo: CBUUID?
 
         func read(_ characteristic: CBUUID) async throws -> Data {
             reads.append(characteristic)
@@ -41,6 +42,8 @@ final class SyaiActivationSequenceTests: XCTestCase {
         }
 
         func write(_ data: Data, to characteristic: CBUUID, withResponse: Bool) async throws {
+            struct LinkDropped: Error {}
+            if characteristic == failWriteTo { throw LinkDropped() }
             writes.append(Write(characteristic: characteristic, data: data, withResponse: withResponse))
         }
 
@@ -51,30 +54,25 @@ final class SyaiActivationSequenceTests: XCTestCase {
         func disconnect() {}
     }
 
-    /// Identity "encryption" so the test can read the plaintext a step wrote. The real
-    /// AES-ECB wrap is covered by `SyaiActivationFrameTests` / `SyaiTransportTests`.
-    private let passthroughEncrypt: (Data) throws -> Data = { $0 }
+    /// Distinct, recognisable stand-ins for the server's encrypted frames.
+    private let coefficientFrame = Data([0xC0, 0xEF, 0x01])
+    private let durationFrame = Data([0xD0, 0x02])
+    private let activateFrame = Data([0xAC, 0x03])
 
-    private func calibration() -> Calibration {
-        Calibration(coefficients: (0 ..< 14).map { Double($0) + 0.5 }, k: 2.0, b: 3.0)
-    }
-
-    /// A device record shaped like a real `validateDeviceByMacV2` response.
-    private func deviceInfo(activeDuration: TimeInterval, preheat: TimeInterval) -> DeviceInfo {
-        DeviceInfo(
-            mac: "112233445566", serialNo: "", batchNo: "", deviceType: "X1",
-            deviceVersion: "V1.6.SH22523.3",
-            coefficients: Array(repeating: 0, count: 14), k: 1, b: 1,
-            produceTime: Date(timeIntervalSince1970: 0),
-            expireTime: nil, activeDuration: activeDuration, preheatDuration: preheat
+    private func activation(
+        coefficient: Data? = Data([0xC0, 0xEF, 0x01]),
+        duration: Data? = Data([0xD0, 0x02]),
+        activate: Data? = Data([0xAC, 0x03])
+    ) -> SyaiRemoteActivation {
+        SyaiRemoteActivation(
+            authHost: Data([0xA1]), authFlag: Data([0xF1]),
+            coefficientFrame: coefficient, durationFrame: duration, activateFrame: activate
         )
     }
 
     func testWriteSetAndOrderMatchTheOfficialApp() async throws {
         let transport = RecordingTransport()
-        try await SyaiActivationSequence.run(
-            transport: transport, calibration: calibration(), encrypt: passthroughEncrypt
-        )
+        try await SyaiActivationSequence.run(transport: transport, activation: activation())
 
         // Exactly four writes — no more (the app sends no calibration/authKey/wake-up
         // /destroy-duration writes) and no fewer.
@@ -91,33 +89,46 @@ final class SyaiActivationSequenceTests: XCTestCase {
         XCTAssertTrue(transport.writes.allSatisfy(\.withResponse))
     }
 
-    /// The calibration frame (`0x0B` on ctlDevice) must not appear at all. Guarding on
-    /// the opcode rather than the count so a reordering can't mask a re-introduction.
-    func testCalibrationParameterIsNeverWritten() async throws {
+    /// The server's frames go out byte-for-byte, each to its own characteristic.
+    func testServerFramesAreWrittenVerbatim() async throws {
         let transport = RecordingTransport()
-        try await SyaiActivationSequence.run(
-            transport: transport, calibration: calibration(), encrypt: passthroughEncrypt
-        )
+        try await SyaiActivationSequence.run(transport: transport, activation: activation())
 
-        let ctlWrites = transport.writes.filter { $0.characteristic == SyaiGATT.ctlDevice }
-        XCTAssertEqual(ctlWrites.count, 1, "ctlDevice should carry only the coefficient frame")
-        for write in ctlWrites {
-            XCTAssertNotEqual(
-                write.data.first,
-                SyaiActivationFrame.opCalibration,
-                "the official app never writes calibration parameters"
-            )
+        func written(to characteristic: CBUUID) -> Data? {
+            transport.writes.first { $0.characteristic == characteristic }?.data
         }
-        XCTAssertEqual(ctlWrites.first?.data.first, SyaiActivationFrame.opCoefficient)
+        XCTAssertEqual(written(to: SyaiGATT.ctlDevice), coefficientFrame)
+        XCTAssertEqual(written(to: SyaiGATT.activeDuration), durationFrame)
+        XCTAssertEqual(written(to: SyaiGATT.cmd), activateFrame)
+    }
+
+    /// A partial server answer must not leave the sensor half-written: every
+    /// frame is checked before the first write.
+    func testMissingFrameAbortsBeforeAnyWrite() async {
+        let partials = [
+            activation(coefficient: nil),
+            activation(duration: nil),
+            activation(activate: nil)
+        ]
+        for partial in partials {
+            let transport = RecordingTransport()
+            do {
+                try await SyaiActivationSequence.run(transport: transport, activation: partial)
+                XCTFail("expected .missingFrame")
+            } catch let error as SyaiActivationSequence.ActivationError {
+                guard case .missingFrame = error else { return XCTFail("wrong error: \(error)") }
+                XCTAssertTrue(transport.writes.isEmpty, "no writes may be issued for a partial answer")
+            } catch {
+                XCTFail("unexpected error: \(error)")
+            }
+        }
     }
 
     /// The end-of-sensor control word shares `ctlDevice` with the coefficient
     /// frame and permanently kills the hardware. Activation must never emit it.
     func testEndSensorCommandIsNeverWrittenDuringActivation() async throws {
         let transport = RecordingTransport()
-        try await SyaiActivationSequence.run(
-            transport: transport, calibration: calibration(), encrypt: passthroughEncrypt
-        )
+        try await SyaiActivationSequence.run(transport: transport, activation: activation())
 
         for write in transport.writes {
             XCTAssertNotEqual(
@@ -132,63 +143,10 @@ final class SyaiActivationSequenceTests: XCTestCase {
     /// used to send off the back of a `[?]` guess from the field name.
     func testRTCIsWrittenAsZero() async throws {
         let transport = RecordingTransport()
-        try await SyaiActivationSequence.run(
-            transport: transport, calibration: calibration(), encrypt: passthroughEncrypt
-        )
+        try await SyaiActivationSequence.run(transport: transport, activation: activation())
 
         let rtc = try XCTUnwrap(transport.writes.first { $0.characteristic == SyaiGATT.currentTime })
         XCTAssertEqual(Array(rtc.data), [0, 0, 0, 0], "RTC payload must be int32LE(0)")
-    }
-
-    /// The written duration is `(activeExpireTime + preheatPeriodTime) / 1000`, and it
-    /// is **per-sensor**. These are the two real records + the exact plaintexts the app
-    /// wrote for them:
-    ///
-    ///     V1.7 AABBCCDDEEFF  activeExpireTime 1_209_600_000 ms + preheat 1_800_000 ms
-    ///                        → wrote `087c1200` = 1_211_400
-    ///     V1.6 112233445566  activeExpireTime 1_814_400_000 ms + preheat 1_800_000 ms
-    ///                        → wrote `88b61b00` = 1_816_200
-    ///
-    /// The old code wrote a hardcoded 1_209_600 for both — over a week short on
-    /// the longer-duration V1.6 unit, on a write that cannot be undone.
-    func testDurationMatchesTheCapturedPlaintextPerSensor() async throws {
-        let vectors: [(info: DeviceInfo, expected: [UInt8])] = [
-            (deviceInfo(activeDuration: 1_209_600, preheat: 1800), [0x08, 0x7C, 0x12, 0x00]),
-            (deviceInfo(activeDuration: 1_814_400, preheat: 1800), [0x88, 0xB6, 0x1B, 0x00])
-        ]
-        for vector in vectors {
-            let transport = RecordingTransport()
-            try await SyaiActivationSequence.run(
-                transport: transport, calibration: calibration(),
-                durationSeconds: SyaiActivationSequence.activationDurationSeconds(for: vector.info),
-                encrypt: passthroughEncrypt
-            )
-
-            let write = try XCTUnwrap(transport.writes.first { $0.characteristic == SyaiGATT.activeDuration })
-            XCTAssertEqual(
-                Array(write.data),
-                vector.expected,
-                "duration payload must match the app's captured plaintext"
-            )
-        }
-    }
-
-    /// The activate command is `0x03`. Blutter renders `_active`'s literal as `6`, but
-    /// that is the **Smi tag** (`3 << 1`) of a `List<int>` element — see
-    /// `SyaiActivationFrame.cmdActivate`. Pinned here because `0x06` is not a command
-    /// the sensor knows, so getting it wrong makes activation fail on hardware only.
-    func testActivateCommandByteIsThree() async throws {
-        let transport = RecordingTransport()
-        try await SyaiActivationSequence.run(
-            transport: transport, calibration: calibration(), encrypt: passthroughEncrypt
-        )
-
-        let cmd = try XCTUnwrap(transport.writes.first { $0.characteristic == SyaiGATT.cmd })
-        XCTAssertEqual(
-            Array(cmd.data),
-            [0x03],
-            "activate cmd is 3 (Smi-untagged), not the literal 6 in the disassembly"
-        )
     }
 
     /// The freshness gate still wins: an already-activated sensor must not be re-fired.
@@ -202,9 +160,7 @@ final class SyaiActivationSequenceTests: XCTestCase {
             let transport = RecordingTransport()
             transport.cmdStateOnRead = state
             do {
-                try await SyaiActivationSequence.run(
-                    transport: transport, calibration: calibration(), encrypt: passthroughEncrypt
-                )
+                try await SyaiActivationSequence.run(transport: transport, activation: activation())
                 XCTFail("expected .alreadyActive for cmd-state \(state)")
             } catch let error as SyaiActivationSequence.ActivationError {
                 guard case let .alreadyActive(reported) = error else {
@@ -222,9 +178,7 @@ final class SyaiActivationSequenceTests: XCTestCase {
         for state in [0, 1, 2] {
             let transport = RecordingTransport()
             transport.cmdStateOnRead = state
-            try await SyaiActivationSequence.run(
-                transport: transport, calibration: calibration(), encrypt: passthroughEncrypt
-            )
+            try await SyaiActivationSequence.run(transport: transport, activation: activation())
             XCTAssertEqual(transport.writes.count, 4, "cmd-state \(state) must still activate")
         }
     }
@@ -235,9 +189,7 @@ final class SyaiActivationSequenceTests: XCTestCase {
     func testOnlyTheFirstByteOfTheCmdReadIsTheState() async throws {
         let transport = RecordingTransport()
         transport.cmdReadPayload = Data([0x00, 0x01, 0xFF, 0xFF])
-        try await SyaiActivationSequence.run(
-            transport: transport, calibration: calibration(), encrypt: passthroughEncrypt
-        )
+        try await SyaiActivationSequence.run(transport: transport, activation: activation())
         XCTAssertEqual(
             transport.writes.count,
             4,
@@ -254,9 +206,7 @@ final class SyaiActivationSequenceTests: XCTestCase {
         let transport = RecordingTransport()
         transport.readError = ReadFailed()
         do {
-            try await SyaiActivationSequence.run(
-                transport: transport, calibration: calibration(), encrypt: passthroughEncrypt
-            )
+            try await SyaiActivationSequence.run(transport: transport, activation: activation())
             XCTFail("expected the read error to propagate")
         } catch {
             XCTAssertTrue(transport.writes.isEmpty, "no writes may be issued when the state is unknown")
@@ -267,9 +217,7 @@ final class SyaiActivationSequenceTests: XCTestCase {
         let transport = RecordingTransport()
         transport.cmdReadPayload = Data()
         do {
-            try await SyaiActivationSequence.run(
-                transport: transport, calibration: calibration(), encrypt: passthroughEncrypt
-            )
+            try await SyaiActivationSequence.run(transport: transport, activation: activation())
             XCTFail("expected .emptyCmdRead")
         } catch let error as SyaiActivationSequence.ActivationError {
             guard case .emptyCmdRead = error else {
@@ -278,6 +226,31 @@ final class SyaiActivationSequenceTests: XCTestCase {
             XCTAssertTrue(transport.writes.isEmpty, "no writes may be issued when the state is unknown")
         } catch {
             XCTFail("unexpected error: \(error)")
+        }
+    }
+
+    /// A failed write names its step and nothing after it goes out: a link that
+    /// dropped mid-sequence is retried on a fresh connection, and a future
+    /// duration step-down needs to know the duration was the last write landed.
+    func testInterruptedWriteNamesItsStepAndStops() async {
+        let cases: [(CBUUID, SyaiActivationSequence.Step, Int)] = [
+            (SyaiGATT.ctlDevice, .coefficient, 0),
+            (SyaiGATT.activeDuration, .duration, 1),
+            (SyaiGATT.currentTime, .rtc, 2),
+            (SyaiGATT.cmd, .activate, 3)
+        ]
+        for (characteristic, expectedStep, landed) in cases {
+            let transport = RecordingTransport()
+            transport.failWriteTo = characteristic
+            do {
+                try await SyaiActivationSequence.run(transport: transport, activation: activation())
+                XCTFail("expected .interrupted at \(expectedStep)")
+            } catch let SyaiActivationSequence.ActivationError.interrupted(step, _) {
+                XCTAssertEqual(step, expectedStep)
+                XCTAssertEqual(transport.writes.count, landed, "no write may follow the failed one")
+            } catch {
+                XCTFail("unexpected error: \(error)")
+            }
         }
     }
 }

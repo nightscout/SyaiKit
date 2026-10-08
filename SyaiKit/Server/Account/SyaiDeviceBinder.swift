@@ -8,8 +8,10 @@
 
 import Foundation
 
-/// Registers a paired sensor to the logged-in Syai account via
-/// `deviceBind/composite/bind`, creating the server-side ownership record.
+/// Registers an activated sensor to the logged-in Syai account via
+/// `deviceBind/composite/bindV3`, creating the server-side ownership record.
+/// The bind response is also where the sensor's own coefficients and BLE key
+/// group are handed out (see `provisioning(from:mac:)`).
 public struct SyaiServerDeviceBinder: Sendable {
     private let backend: SyaiBackend
     private let client: SyaiEnvelopedClient
@@ -40,30 +42,47 @@ public struct SyaiServerDeviceBinder: Sendable {
     }
 
     /// Register `mac` to the logged-in account. Returns the parsed bind
-    /// response (`SyaiBindResult`): `code` is `OK`/`SUCCESS` on success, a
-    /// business code on a server rejection, or `SKIPPED_NO_VERSION` when the
-    /// record has no `deviceVersion`.
-    public func bind(mac: String, deviceInfo: DeviceInfo, activatedAt: Date) async throws -> SyaiBindResult {
+    /// response (`SyaiBindResult`): `code` is `OK`/`SUCCESS` on success or a
+    /// business code on a server rejection. `stateInfo` is the hex of the
+    /// sensor-state read the official app sends for some firmwares; empty
+    /// otherwise.
+    public func bind(
+        mac: String,
+        deviceVersion: String,
+        activatedAt: Date,
+        stateInfo: String = ""
+    ) async throws -> SyaiBindResult {
         guard backend.isConfigured else { throw BindError.notConfigured }
-        // The server rejects a null/empty deviceVersion with HardwareVersion_NotNull;
-        // skip the request rather than fire a known-bad one.
-        guard !deviceInfo.deviceVersion.isEmpty else { return SyaiBindResult(code: "SKIPPED_NO_VERSION") }
-
         let activeTimeMs = Int(activatedAt.timeIntervalSince1970 * 1000)
         return try await sessionRetrying.run(client: client, backend: backend) { client, _ in
             try await client.bind(
                 mac: mac,
-                deviceVersion: deviceInfo.deviceVersion,
-                activeTime: activeTimeMs
+                deviceVersion: deviceVersion,
+                activeTime: activeTimeMs,
+                stateInfo: stateInfo
             )
         }
+    }
+
+    /// The sensor's own coefficients and key group from a successful bind.
+    /// Throws when the record is missing or incomplete; callers fall back to
+    /// `SyaiBoundSensorLookup`, never to defaults.
+    public func provisioning(from result: SyaiBindResult, mac: String) throws -> SyaiProvisioning {
+        guard let record = result.deviceRecord,
+              let body = try? JSONSerialization.jsonObject(with: record) as? [String: Any]
+        else {
+            throw SyaiServerCalibrationProvider.ServerError.decode("bind response has no device record")
+        }
+        return try SyaiServerCalibrationProvider.provisioning(
+            fromDeviceBody: body, mac: mac, glucoseSecretKey: backend.glucoseSecretKey
+        )
     }
 
     /// Release `mac` from the logged-in account, ending the sensor's session
     /// server-side.
     ///
     /// One-way in practice: after this the server answers
-    /// `validateDeviceByMacV2` for the MAC with `AppDevice_EndUsing` forever,
+    /// `validateDeviceByMacV3` for the MAC with `AppDevice_EndUsing` forever,
     /// so the sensor can never be paired again by anyone.
     public func unbind(mac: String, reason: SyaiUnbindReason) async throws -> String {
         guard backend.isConfigured else { throw BindError.notConfigured }
@@ -83,17 +102,16 @@ public struct SyaiServerDeviceBinder: Sendable {
 }
 
 public extension SyaiEnvelopedClient {
-    /// `POST deviceBind/composite/bind`, registers `mac` to the logged-in
-    /// account. Fixed 6-field body; no md5 `signature` (unlike
-    /// validateMac/login), auth is the JWT `Authorization` header plus the
-    /// secure-channel `cipherBodySignature` only.
-    ///
-    /// `userId` is sent as an explicit JSON `null` (not a `patientId` field),
-    /// `newBindType:1`, and `activeTime` is the activation moment in epoch-ms.
+    /// `POST deviceBind/composite/bindV3`, registers `mac` to the logged-in
+    /// account. Body `{mac, deviceType, deviceVersion, activeTime, newBindType,
+    /// deviceInfo}`; no md5 `signature`, auth is the JWT `Authorization` header
+    /// plus the secure-channel `cipherBodySignature` only. `activeTime` is the
+    /// activation moment in epoch-ms.
     func bind(
         mac: String,
         deviceVersion: String,
-        activeTime: Int = 0
+        activeTime: Int = 0,
+        stateInfo: String = ""
     ) async throws -> SyaiBindResult {
         guard backend.isConfigured else { throw TransportError.notConfigured }
         // Pairing has no offline fallback so always try fresh.
@@ -104,9 +122,9 @@ public extension SyaiEnvelopedClient {
             "deviceVersion": deviceVersion,
             "activeTime": activeTime,
             "newBindType": 1,
-            "userId": NSNull()
+            "deviceInfo": stateInfo
         ]
-        let data = try await envelopedPOST(path: "deviceBind/composite/bind", body: body)
+        let data = try await envelopedPOST(path: "deviceBind/composite/bindV3", body: body)
         return SyaiBindResult.parse(decryptedResponse: data)
     }
 
@@ -131,7 +149,7 @@ public extension SyaiEnvelopedClient {
 
     /// `POST deviceBind/markDeviceStatus`: the "binding in progress" bracket.
     /// Fires as the first and last thing around a bind: `(mac, true)`
-    /// immediately before `composite/bind`, `(mac, false)` immediately after.
+    /// immediately before `composite/bindV3`, `(mac, false)` immediately after.
     /// Body: `{"mac": <mac>, "state": <int 1/0>, "duration": 5}` (`state` is
     /// an integer, not a bool). This bracket tolerates a throw and proceeds
     /// regardless, so pairing is never blocked by it.
@@ -147,37 +165,48 @@ public extension SyaiEnvelopedClient {
     }
 }
 
-/// The parsed response of `deviceBind/composite/bind`. The `method` blob is
+/// The parsed response of `deviceBind/composite/bindV3`. The `method` blob is
 /// persisted verbatim but deliberately not decrypted or compared.
+/// `deviceRecord` is the sensor's device record (`cgmDeviceRespVO`) as JSON,
+/// which carries its coefficients and key group.
 public struct SyaiBindResult: Sendable, Equatable {
     public let code: String
     public let methodId: Int?
     public let methodUpdateTime: Int64?
     public let methodBlob: String?
+    public let deviceRecord: Data?
 
     public init(
         code: String,
         methodId: Int? = nil,
         methodUpdateTime: Int64? = nil,
-        methodBlob: String? = nil
+        methodBlob: String? = nil,
+        deviceRecord: Data? = nil
     ) {
         self.code = code
         self.methodId = methodId
         self.methodUpdateTime = methodUpdateTime
         self.methodBlob = methodBlob
+        self.deviceRecord = deviceRecord
     }
+
+    public var isSuccess: Bool { code == "OK" || code == "SUCCESS" }
 
     public static func parse(decryptedResponse data: Data) -> SyaiBindResult {
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return SyaiBindResult(code: "OK")
         }
         let code = (root["code"] as? String) ?? "OK"
-        let vo = (root["data"] as? [String: Any])?["cgmDeviceMethodVO"] as? [String: Any]
+        let body = root["data"] as? [String: Any]
+        let device = body?["cgmDeviceRespVO"] as? [String: Any]
+        // The method lived in its own VO on the old bind; the V3 record carries it inline.
+        let vo = (body?["cgmDeviceMethodVO"] as? [String: Any]) ?? device
         return SyaiBindResult(
             code: code,
             methodId: (vo?["methodId"] as? NSNumber)?.intValue,
             methodUpdateTime: (vo?["methodUpdateTime"] as? NSNumber)?.int64Value,
-            methodBlob: vo?["method"] as? String
+            methodBlob: vo?["method"] as? String,
+            deviceRecord: device.flatMap { try? JSONSerialization.data(withJSONObject: $0) }
         )
     }
 }

@@ -214,10 +214,10 @@ public final class SyaiCGMManager: CGMManager, @unchecked Sendable {
     public required convenience init?(rawState: SyaiCGMManager.RawStateValue) {
         self.init(initialState: CGMManagerState(rawValue: rawState) ?? CGMManagerState())
 
-        if let pending = state.sensors.pendingActivation {
+        if let pending = state.sensors.pendingBind {
             logger
                 .warning(
-                    "pending-activation record parked for \(SyaiRedact.mac(pending.mac)): a previous activation was interrupted. Re-run pairing to resume, coefficients are preserved, no re-fetch needed."
+                    "pending bind for \(SyaiRedact.mac(pending.mac)): the sensor was activated but its bind didn't complete. Re-run pairing for it to resume at the bind."
                 )
         }
     }

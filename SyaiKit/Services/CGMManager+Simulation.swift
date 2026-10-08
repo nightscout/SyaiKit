@@ -189,7 +189,11 @@
     }
 
     private struct SyaiSimulatedCalibrationProvider: CalibrationProvider {
-        func provision(forMAC _: String) async throws -> SyaiProvisioning {
+        func validate(mac _: String) async throws -> SyaiSensorValidation {
+            throw SyaiCGMManager.AccountError.notLoggedIn
+        }
+
+        func authorizeActivation(mac _: String, authDev _: Data, authFlag _: Data) async throws -> SyaiRemoteActivation {
             throw SyaiCGMManager.AccountError.notLoggedIn
         }
     }

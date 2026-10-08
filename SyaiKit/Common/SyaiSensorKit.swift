@@ -107,23 +107,61 @@ public struct SyaiDecryptedFrame: Equatable, Sendable {
     }
 }
 
-/// Device record + BLE keys resolved for a MAC. The sensor must be a still-unbound
-/// factory sensor for the fetch to succeed at all (an already-bound sensor can't
-/// be fetched, so there is no attach path). `keyGroup` is optional to accommodate
-/// providers/fakes with no real keys; shipping providers always supply one.
-public struct SyaiProvisioning: Sendable {
+/// A sensor's own device record (identity, coefficients, durations) and BLE key
+/// group, as the server hands them out once the sensor is bound to the account.
+public struct SyaiProvisioning: Equatable, Sendable {
     public let deviceInfo: DeviceInfo
-    public let keyGroup: SyaiKeyGroup?
-    public init(deviceInfo: DeviceInfo, keyGroup: SyaiKeyGroup?) {
+    public let keyGroup: SyaiKeyGroup
+    public init(deviceInfo: DeviceInfo, keyGroup: SyaiKeyGroup) {
         self.deviceInfo = deviceInfo
         self.keyGroup = keyGroup
     }
 }
 
-/// Supplies the per-sensor `DeviceInfo` (identity + calibration coefficients) and
-/// BLE key group for a MAC. Kept separate from `SyaiBLE` so the sourcing strategy
-/// is swappable. There is deliberately no offline/default implementation: a sensor
-/// without a real per-sensor record is not paired.
+/// The pre-activation answer for a factory sensor (`validateDeviceByMacV3`).
+/// It confirms the account may start this sensor and carries what the bind
+/// needs. Coefficients and keys are not handed out until the sensor is bound;
+/// when the server does include coefficients they're kept, so the post-bind
+/// set can be checked against them.
+public struct SyaiSensorValidation: Equatable, Sendable {
+    public let mac: String
+    public let deviceVersion: String
+    public let coefficients: [Double]?
+
+    public init(mac: String, deviceVersion: String, coefficients: [Double]? = nil) {
+        self.mac = mac
+        self.deviceVersion = deviceVersion
+        self.coefficients = coefficients
+    }
+}
+
+/// Server-built activation material for one BLE connection (`cgmAuth/verify`).
+/// The server answers the sensor's auth challenge itself, so the phone holds
+/// neither the key group nor the session key while activating; every frame
+/// below is already encrypted for this connection and is written verbatim.
+public struct SyaiRemoteActivation: Equatable, Sendable {
+    /// Written to `authHost` / `authFlag` to complete the handshake.
+    public let authHost: Data
+    public let authFlag: Data
+    /// Written to `ctlDevice`, `activeDuration` and `cmd` respectively.
+    public let coefficientFrame: Data?
+    public let durationFrame: Data?
+    public let activateFrame: Data?
+
+    public init(authHost: Data, authFlag: Data, coefficientFrame: Data?, durationFrame: Data?, activateFrame: Data?) {
+        self.authHost = authHost
+        self.authFlag = authFlag
+        self.coefficientFrame = coefficientFrame
+        self.durationFrame = durationFrame
+        self.activateFrame = activateFrame
+    }
+}
+
+/// The server side of activating a factory sensor. Kept separate from `SyaiBLE`
+/// so the BLE layer never talks to the account. There is deliberately no
+/// offline/default implementation: a sensor without its own server record is
+/// not paired.
 public protocol CalibrationProvider: Sendable {
-    func provision(forMAC mac: String) async throws -> SyaiProvisioning
+    func validate(mac: String) async throws -> SyaiSensorValidation
+    func authorizeActivation(mac: String, authDev: Data, authFlag: Data) async throws -> SyaiRemoteActivation
 }

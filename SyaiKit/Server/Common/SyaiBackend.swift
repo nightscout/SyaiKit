@@ -17,8 +17,8 @@ public struct SyaiBackend: Sendable {
     /// JWT session credentials.
     public var credentials: SyaiCredentials
 
-    /// Per-account KDF seed from login/refresh. Unwraps the `validateDeviceByMacV2` coefficient
-    /// blob and `keyA`; nil until login completes.
+    /// Per-account KDF seed from login/refresh. Unwraps the coefficient blob and
+    /// `keyA` the bind hands out; nil until login completes.
     public var glucoseSecretKey: String?
 
     /// Hardcoded request-signing key baked into the binary; not a per-account secret.
@@ -59,8 +59,8 @@ public struct SyaiBackend: Sendable {
         deviceId: String,
         glucoseSecretKey: String? = nil,
         packageName: String = "com.syai.tag",
-        versionName: String = "1.27.0",
-        versionCode: String = "262731",
+        versionName: String = "1.35.0",
+        versionCode: String = "263931",
         userAgent: String = "ios",
         unit: String = "mmol_L",
         deviceModel: String = SyaiBackend.deviceHardwareModel,
@@ -167,7 +167,7 @@ public struct SyaiBackend: Sendable {
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
-    /// `signValidateMac`: `md5(appName + deviceId + timestamp + mac + deviceSignKey)`.
+    /// `signValidateMac` (`validateDeviceByMacV3`): `md5(appName + deviceId + timestamp + mac + deviceSignKey)`.
     public func signValidateMac(mac: String, timestamp: String) -> String {
         md5Hex(appName + deviceId + timestamp + mac + SyaiBackend.deviceSignKey)
     }
@@ -176,6 +176,11 @@ public struct SyaiBackend: Sendable {
     public func signAuthInfo(mac: String, timestamp: String) -> String {
         let key = SyaiBackend.deviceSignKey
         return md5Hex(key + appName + deviceId + mac + timestamp + key)
+    }
+
+    /// `cgmAuth/verify`: `md5(appName + deviceId + mac + authDevHex + authFlagHex + timestamp + deviceSignKey)`.
+    public func signCgmAuthVerify(mac: String, authDevHex: String, authFlagHex: String, timestamp: String) -> String {
+        md5Hex(appName + deviceId + mac + authDevHex + authFlagHex + timestamp + SyaiBackend.deviceSignKey)
     }
 
     /// `signApiToken`: `md5(appName + deviceId + timestamp + deviceSignKey)`.
@@ -198,8 +203,8 @@ public struct SyaiBackend: Sendable {
         baseURL.appendingPathComponent(pathPrefix).appendingPathComponent(path)
     }
 
-    /// Standard header set. `productModel` is opt-in because only `validateDeviceByMacV2`
-    /// and `authInfo` send it. `timestamp` is fresh; callers that already signed a timestamp
+    /// Standard header set. `productModel` is opt-in because only `validateDeviceByMacV3`,
+    /// `cgmAuth/verify` and `authInfo` send it. `timestamp` is fresh; callers that already signed a timestamp
     /// must overwrite it after this call.
     func applyBaseHeaders(_ request: inout URLRequest, includeProductModel: Bool = false) {
         if includeProductModel {

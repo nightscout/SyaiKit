@@ -8,10 +8,15 @@
 
 import Foundation
 
-/// Fetches per-sensor calibration from Syai's server, the one genuine online
-/// dependency of the BYOA model. Calls `validateDeviceByMacV2(mac)` over the
-/// user's JWT session, returning the per-sensor coefficients `C0..C13` and the
-/// BLE key group.
+/// The server side of activating a factory sensor, the one genuine online
+/// dependency of the BYOA model, over the user's JWT session:
+///
+/// 1. `validateDeviceByMacV3` confirms the sensor may be started.
+/// 2. `cgmAuth/verify` answers the sensor's BLE auth challenge server-side and
+///    returns the activation frames, already encrypted for that connection.
+///
+/// The sensor's own coefficients and BLE key group only come back once it is
+/// bound (`SyaiServerDeviceBinder.bind`), parsed by `provisioning(fromDeviceBody:)`.
 public struct SyaiServerCalibrationProvider: CalibrationProvider {
     private let backend: SyaiBackend
     private let client: SyaiEnvelopedClient
@@ -19,6 +24,7 @@ public struct SyaiServerCalibrationProvider: CalibrationProvider {
     /// `SyaiDeviceBinder`. `recoverSession` is invoked only on auth-shaped
     /// failures (`TransportError.isAuthFailure`) for one silent re-login retry.
     private let sessionRetrying: SyaiSessionRetrying
+    private static let logger = SyaiLogger(category: "CalibrationProvider")
 
     public init(
         backend: SyaiBackend = .syaiTemplate,
@@ -43,9 +49,9 @@ public struct SyaiServerCalibrationProvider: CalibrationProvider {
         public var description: String {
             switch self {
             case .notConfigured: return "Syai backend credentials not configured (log in first)."
-            case .noSecretKey: return "Missing glucoseSecretKey (needed to decipher coefficients). Set it from a login/refresh, or embed it."
+            case .noSecretKey: return "Missing glucoseSecretKey (needed to decipher coefficients). Log in again."
             case let .business(c): return Self.describeBusiness(code: c)
-            case let .decode(m): return "Couldn't decode the calibration response: \(m)."
+            case let .decode(m): return "Couldn't decode the server's sensor record: \(m)."
             }
         }
 
@@ -54,7 +60,7 @@ public struct SyaiServerCalibrationProvider: CalibrationProvider {
         static func describeBusiness(code: String) -> String {
             switch code {
             case "AppDevice_AlreadyUsed":
-                return "This sensor was already activated (by any account). Its calibration can never be re-fetched, so it can't be paired again. Use a fresh, never-activated sensor."
+                return "This sensor was already activated (by any account), so it can't be paired again. Use a fresh, never-activated sensor."
             case "AppDevice_EndUsing":
                 return "This sensor's session has ended (wear window elapsed or ended in the official app). It can't be paired. Use a fresh sensor."
             case "AppDevice_NotExist":
@@ -71,40 +77,96 @@ public struct SyaiServerCalibrationProvider: CalibrationProvider {
         }
     }
 
-    /// Enveloped GET `/device/validateDeviceByMacV2`. One call yields both the
-    /// coefficients and the BLE key group. Dead-JWT retry + token-rotation
-    /// persistence via `sessionRetrying`.
-    public func provision(forMAC mac: String) async throws -> SyaiProvisioning {
+    public func validate(mac: String) async throws -> SyaiSensorValidation {
         guard backend.isConfigured else { throw ServerError.notConfigured }
         return try await sessionRetrying.run(client: client, backend: backend) { client, backend in
             let data = try await client.validateMac(mac)
-            return try Self.parse(data, mac: mac, glucoseSecretKey: backend.glucoseSecretKey)
+            return try Self.parseValidation(data, mac: mac, glucoseSecretKey: backend.glucoseSecretKey)
         }
     }
 
-    /// Parse a `validateDeviceByMacV2` response into `DeviceInfo`.
-    ///
-    /// `coefficient` deciphers to `C0..C13` via `SyaiCoefficientDecipher`
-    /// (needs `glucoseSecretKey`); `K`/`B` are the plain adjust values, used
-    /// verbatim. Non-`OK` codes surface as `.business`.
-    static func parse(_ data: Data, mac: String, glucoseSecretKey: String?) throws -> SyaiProvisioning {
-        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw ServerError.decode("not a JSON object")
+    public func authorizeActivation(mac: String, authDev: Data, authFlag: Data) async throws -> SyaiRemoteActivation {
+        guard backend.isConfigured else { throw ServerError.notConfigured }
+        return try await sessionRetrying.run(client: client, backend: backend) { client, _ in
+            let data = try await client.verifyCgmAuth(mac: mac, authDev: authDev, authFlag: authFlag)
+            return try Self.parseRemoteActivation(data, mac: mac)
         }
-        let code = (root["code"] as? String) ?? "OK"
-        guard code == "OK" else { throw ServerError.business(code: code) }
-        guard let body = root["data"] as? [String: Any] else {
-            throw ServerError.decode("no 'data' object")
+    }
+
+    /// Parse a `validateDeviceByMacV3` response. Only the code and the firmware
+    /// version (which the bind needs) are required. Coefficients are kept when
+    /// the server includes them, purely as a cross-check for the post-bind set.
+    static func parseValidation(_ data: Data, mac: String, glucoseSecretKey: String?) throws -> SyaiSensorValidation {
+        let body = try okDataObject(data)
+        logger.info("validate: fields present \(body.keys.sorted())")
+        let respMac = (body["mac"] as? String) ?? mac
+        var coefficients: [Double]?
+        if let coeffB64 = body["coefficient"] as? String, !coeffB64.isEmpty,
+           let coeffUpdateTime = (body["coeffUpdateTime"] as? NSNumber)?.int64Value,
+           let gsk = glucoseSecretKey, !gsk.isEmpty
+        {
+            do {
+                coefficients = try SyaiCoefficientDecipher.decipher(
+                    base64Coefficient: coeffB64, coeffUpdateTime: coeffUpdateTime,
+                    mac: respMac, glucoseSecretKey: gsk
+                )
+            } catch {
+                logger.warning("validate: coefficient present but did not decipher: \(error)")
+            }
         }
+        return SyaiSensorValidation(
+            mac: respMac,
+            deviceVersion: body["deviceVersion"] as? String ?? "",
+            coefficients: coefficients
+        )
+    }
+
+    /// Parse a `cgmAuth/verify` response: `{mac, auth, shaInfo, c, d, cf, kb}`,
+    /// all hex. `auth`/`shaInfo` complete the handshake on `authHost`/`authFlag`;
+    /// `cf`, `d` and `c` are the coefficient, duration and activate frames.
+    /// `kb` has no consumer in the official app's activation path and is ignored.
+    static func parseRemoteActivation(_ data: Data, mac: String) throws -> SyaiRemoteActivation {
+        let body = try okDataObject(data)
+        // Field presence only: these are live auth material for an open link.
+        logger.info("cgmAuth/verify: fields present \(body.keys.sorted())")
+        if let respMac = body["mac"] as? String, !respMac.isEmpty,
+           respMac.uppercased() != mac.uppercased()
+        {
+            throw ServerError.decode("cgmAuth/verify answered for a different sensor")
+        }
+        func hex(_ key: String) throws -> Data? {
+            guard let s = body[key] as? String, !s.isEmpty else { return nil }
+            guard let d = Self.data(fromHex: s) else { throw ServerError.decode("'\(key)' is not hex") }
+            return d
+        }
+        guard let authHost = try hex("auth") else { throw ServerError.decode("no 'auth' in cgmAuth/verify") }
+        guard let authFlag = try hex("shaInfo") else { throw ServerError.decode("no 'shaInfo' in cgmAuth/verify") }
+        return SyaiRemoteActivation(
+            authHost: authHost,
+            authFlag: authFlag,
+            coefficientFrame: try hex("cf"),
+            durationFrame: try hex("d"),
+            activateFrame: try hex("c")
+        )
+    }
+
+    /// Parse a bound sensor's device record (the bind response's
+    /// `cgmDeviceRespVO`) into its own coefficients and key group. Every field
+    /// the decode depends on is required: no default fallback (dosing gate).
+    static func provisioning(fromDeviceBody body: [String: Any], mac: String, glucoseSecretKey: String?) throws
+        -> SyaiProvisioning
+    {
         guard let gsk = glucoseSecretKey, !gsk.isEmpty else { throw ServerError.noSecretKey }
-        guard let coeffB64 = body["coefficient"] as? String else {
+        let respMac = (body["mac"] as? String) ?? mac
+        guard respMac.uppercased() == mac.uppercased() else {
+            throw ServerError.decode("record is for a different sensor")
+        }
+        guard let coeffB64 = body["coefficient"] as? String, !coeffB64.isEmpty else {
             throw ServerError.decode("no 'coefficient' field")
         }
         guard let coeffUpdateTime = (body["coeffUpdateTime"] as? NSNumber)?.int64Value else {
             throw ServerError.decode("no 'coeffUpdateTime'")
         }
-        let respMac = (body["mac"] as? String) ?? mac
-
         let coefficients: [Double]
         do {
             coefficients = try SyaiCoefficientDecipher.decipher(
@@ -113,32 +175,18 @@ public struct SyaiServerCalibrationProvider: CalibrationProvider {
             )
         } catch { throw ServerError.decode("coefficient decipher: \(error)") }
 
-        // K/B are used verbatim as the server returns them. No default fallback
-        // (dosing gate): installing 1.0/0.0 in place of a missing value would
-        // silently scale/shift every decoded reading.
-        guard let k = (body["calibrationValueK"] as? NSNumber)?.doubleValue else {
-            throw ServerError.decode("no 'calibrationValueK'")
-        }
-        guard let b = (body["calibrationValueB"] as? NSNumber)?.doubleValue else {
-            throw ServerError.decode("no 'calibrationValueB'")
-        }
-
         let produceTimeRaw = (body["produceTime"] as? NSNumber)?.int64Value
         let produceTime = produceTimeRaw
             .map { Date(timeIntervalSince1970: Double($0) / 1000) } ?? Date(timeIntervalSince1970: 0)
-        // `activeExpireTime` is the wear duration in ms (varies by unit), not
-        // an absolute timestamp. A real response always carries this alongside
-        // the coefficients; no default fallback.
+        // `activeExpireTime` is the wear duration in ms (varies by unit), not an
+        // absolute timestamp; `preheatPeriodTime` (ms) is the warm-up.
         guard let activeExpireTimeMs = (body["activeExpireTime"] as? NSNumber)?.doubleValue else {
             throw ServerError.decode("no 'activeExpireTime'")
         }
-        let activeDuration = activeExpireTimeMs / 1000
-        // `preheatPeriodTime` (ms) is the warm-up. The activation write is
-        // (activeExpireTime + preheatPeriodTime)/1000.
         guard let preheatPeriodTimeMs = (body["preheatPeriodTime"] as? NSNumber)?.doubleValue else {
             throw ServerError.decode("no 'preheatPeriodTime'")
         }
-        let preheatDuration = preheatPeriodTimeMs / 1000
+
         let deviceInfo = DeviceInfo(
             mac: respMac,
             serialNo: body["serialNo"] as? String ?? "",
@@ -146,26 +194,40 @@ public struct SyaiServerCalibrationProvider: CalibrationProvider {
             deviceType: body["deviceType"] as? String ?? "",
             deviceVersion: body["deviceVersion"] as? String ?? "",
             coefficients: coefficients,
-            k: k, b: b,
+            // K/B only ever fed the old phone-built activation write; the decoder doesn't read them.
+            k: (body["calibrationValueK"] as? NSNumber)?.doubleValue ?? 1,
+            b: (body["calibrationValueB"] as? NSNumber)?.doubleValue ?? 0,
             produceTime: produceTime,
             expireTime: nil,
-            activeDuration: activeDuration,
-            preheatDuration: preheatDuration
+            activeDuration: activeExpireTimeMs / 1000,
+            preheatDuration: preheatPeriodTimeMs / 1000
         )
-
-        let keyGroup = try Self.parseKeyGroup(
-            body: body, respMac: respMac, produceTimeRaw: produceTimeRaw,
-            glucoseSecretKey: gsk
+        let keyGroup = try parseKeyGroup(
+            body: body, respMac: respMac, produceTimeRaw: produceTimeRaw, glucoseSecretKey: gsk
         )
         return SyaiProvisioning(deviceInfo: deviceInfo, keyGroup: keyGroup)
     }
 
-    private static func data(fromHex hex: String) -> Data? {
+    /// The `data` object of an `OK` response; a non-OK code surfaces as `.business`.
+    private static func okDataObject(_ data: Data) throws -> [String: Any] {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw ServerError.decode("not a JSON object")
+        }
+        let code = (root["code"] as? String) ?? "OK"
+        guard code == "OK" else { throw ServerError.business(code: code) }
+        guard let body = root["data"] as? [String: Any] else {
+            throw ServerError.decode("no 'data' object")
+        }
+        return body
+    }
+
+    static func data(fromHex hex: String) -> Data? {
+        guard hex.count.isMultiple(of: 2) else { return nil }
         var data = Data()
         data.reserveCapacity(hex.count / 2)
         var index = hex.startIndex
         while index < hex.endIndex {
-            let next = hex.index(index, offsetBy: 2, limitedBy: hex.endIndex) ?? hex.endIndex
+            let next = hex.index(index, offsetBy: 2)
             guard let byte = UInt8(hex[index ..< next], radix: 16) else { return nil }
             data.append(byte)
             index = next
@@ -207,20 +269,43 @@ public struct SyaiServerCalibrationProvider: CalibrationProvider {
 }
 
 public extension SyaiEnvelopedClient {
-    /// GET `device/validateDeviceByMacV2`, enveloped body `{mac, signature}`,
-    /// with the access-token `Authorization` + `customerId` headers. This is the
-    /// one call the app sends `includeProductModel` on.
+    /// POST `device/validateDeviceByMacV3`, enveloped body `{mac, signature}`,
+    /// with the access-token `Authorization` + `customerId` headers and
+    /// `productModel`. Same body and signature as the retired V2 GET.
     func validateMac(_ mac: String) async throws -> Data {
         guard backend.isConfigured else { throw TransportError.notConfigured }
         // Pairing has no offline fallback; always try fresh.
         try await ensureAccessToken(bypassKnownLockout: true)
         let ts = SyaiBackend.timestampMillis()
         let signature = backend.signValidateMac(mac: mac, timestamp: ts)
-        return try await envelopedGET(
-            path: "device/validateDeviceByMacV2",
+        return try await envelopedPOST(
+            path: "device/validateDeviceByMacV3",
             body: ["mac": mac, "signature": signature],
             extraHeaders: ["timestamp": ts],
             includeProductModel: true
         )
+    }
+
+    /// POST `cgmAuth/verify`: hands the sensor's auth challenge (`authDev` and
+    /// `authFlag` as read, uppercase hex) to the server, which answers it for
+    /// this connection. Body `{mac, paramStr, shaInfo, sign}`, signed over the
+    /// millisecond `timestamp` header.
+    func verifyCgmAuth(mac: String, authDev: Data, authFlag: Data) async throws -> Data {
+        guard backend.isConfigured else { throw TransportError.notConfigured }
+        try await ensureAccessToken(bypassKnownLockout: true)
+        let ts = SyaiBackend.timestampMillis()
+        let paramStr = Self.upperHex(authDev)
+        let shaInfo = Self.upperHex(authFlag)
+        let sign = backend.signCgmAuthVerify(mac: mac, authDevHex: paramStr, authFlagHex: shaInfo, timestamp: ts)
+        return try await envelopedPOST(
+            path: "cgmAuth/verify",
+            body: ["mac": mac, "paramStr": paramStr, "shaInfo": shaInfo, "sign": sign],
+            extraHeaders: ["timestamp": ts],
+            includeProductModel: true
+        )
+    }
+
+    static func upperHex(_ data: Data) -> String {
+        data.map { String(format: "%02X", $0) }.joined()
     }
 }

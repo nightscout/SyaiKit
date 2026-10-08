@@ -46,8 +46,8 @@ final class SyaiLiveVerifyTests: XCTestCase {
         )
         XCTAssertTrue(template.deviceId.hasPrefix("Syai Tag:i:n:"), "iOS-native install deviceId")
         XCTAssertEqual(template.userAgent, "ios")
-        XCTAssertEqual(template.versionName, "1.27.0")
-        XCTAssertEqual(template.versionCode, "262731")
+        XCTAssertEqual(template.versionName, "1.35.0")
+        XCTAssertEqual(template.versionCode, "263931")
 
         let client = SyaiEnvelopedClient(backend: template)
 

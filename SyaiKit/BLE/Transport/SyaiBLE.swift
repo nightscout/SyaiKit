@@ -76,41 +76,70 @@ public final class SyaiBLE: @unchecked Sendable {
         return makeSession(s, keyGroup: keyGroup, cmdState: s.cmdState)
     }
 
-    public func activate(
-        identity: SyaiSensorIdentity,
-        keyGroup: SyaiKeyGroup?,
-        calibration: Calibration,
-        activeDurationSeconds: UInt32
-    ) async throws -> SyaiSensorSession {
-        guard let keyGroup else { throw SyaiPairingService.Failure.noKeyGroup }
+    /// What a remote activation left behind. The link is closed afterwards:
+    /// the server held the session key for it, so nothing can be read on it.
+    public struct RemoteActivationOutcome: Sendable {
+        public let peripheralID: UUID
+        public let firmwareVersion: String
+        /// False when the cmd gate found the sensor already activated and no
+        /// activation frame was written.
+        public let didActivate: Bool
+    }
 
-        let s = try await connectAndAuth(
-            mac: identity.mac,
-            keyGroup: keyGroup,
-            expectedPeripheralID: nil,
-            scanTimeout: scanTimeout
-        )
-        try refuseUnverifiedFirmware(s)
-        var cmdState = s.cmdState
+    /// Activates a factory sensor the way the official app now does: the
+    /// sensor's auth challenge (`authDev` + `authFlag`) is answered by the
+    /// server through `authorize`, which also returns the encrypted activation
+    /// frames for this connection. The phone never holds the key group or the
+    /// session key here; the key group arrives with the bind afterwards, and
+    /// streaming starts on a fresh, locally authenticated connection.
+    public func activateRemotely(
+        identity: SyaiSensorIdentity,
+        authorize: @Sendable (_ authDev: Data, _ authFlag: Data) async throws -> SyaiRemoteActivation
+    ) async throws -> RemoteActivationOutcome {
+        let peripheral = try await connect(mac: identity.mac, expectedPeripheralID: nil, scanTimeout: scanTimeout)
+        defer { peripheral.disconnect() }
+
+        let firmware = await readFirmware(peripheral)
+        try refuseUnverifiedFirmware(peripheral: peripheral, firmwareVersion: firmware.version, parseVersion: firmware.parseVersion)
+
+        let authDev: Data
+        let authFlag: Data
         do {
-            logger.info("activating sensor mac=\(SyaiRedact.mac(identity.mac))")
-            try await SyaiActivationSequence.run(
-                transport: s.peripheral, calibration: calibration,
-                durationSeconds: activeDurationSeconds,
-                encrypt: {
-                    try self.aes.encryptECB(
-                        SyaiActivationFrame.zeroPadToBlock($0),
-                        key: s.sessionKey,
-                        padding: false
-                    )
-                }
-            )
+            authDev = try await peripheral.read(SyaiGATT.authDev)
+            authFlag = try await peripheral.read(SyaiGATT.authFlag)
+        } catch {
+            throw SyaiPairingService.Failure.droppedAfterConnect(error.localizedDescription)
+        }
+        logger.debug("remote auth: challenge read (authDev \(authDev.count) B, authFlag \(authFlag.count) B)")
+        // An all-zero signature is not a real challenge yet; don't spend a server round-trip on it.
+        guard authFlag.contains(where: { $0 != 0 }) else {
+            throw SyaiPairingService.Failure.droppedAfterConnect("sensor presented an empty auth challenge")
+        }
+
+        let activation = try await authorize(authDev, authFlag)
+
+        do {
+            try await peripheral.write(activation.authHost, to: SyaiGATT.authHost, withResponse: true)
+            try await peripheral.write(activation.authFlag, to: SyaiGATT.authFlag, withResponse: true)
+        } catch {
+            throw SyaiPairingService.Failure.droppedAfterConnect(error.localizedDescription)
+        }
+        logger.debug("remote auth: server answer written")
+
+        var didActivate = false
+        do {
+            logger.info("activating sensor mac=\(SyaiRedact.mac(identity.mac)) fw=\"\(firmware.version)\"")
+            try await SyaiActivationSequence.run(transport: peripheral, activation: activation)
+            didActivate = true
             logger.info("activated sensor mac=\(SyaiRedact.mac(identity.mac))")
-            cmdState = Self.healthyCmdState
         } catch let SyaiActivationSequence.ActivationError.alreadyActive(state) {
             logger.info("sensor already activated (cmd-state \(state)); skipping writes mac=\(SyaiRedact.mac(identity.mac))")
         }
-        return makeSession(s, keyGroup: keyGroup, cmdState: cmdState)
+        return RemoteActivationOutcome(
+            peripheralID: peripheral.peripheralID,
+            firmwareVersion: firmware.version,
+            didActivate: didActivate
+        )
     }
 
     public func rawChannels(from frame: SyaiDecryptedFrame) throws -> SyaiGlucoseDecoder.RawChannels {
@@ -129,20 +158,33 @@ public final class SyaiBLE: @unchecked Sendable {
     // 0: starting, 1: self-test, 2: unactivated, 3: healthy, 4: faulty/obsolete
     static let healthyCmdState = 3
 
+    private func connect(mac: String, expectedPeripheralID: UUID?, scanTimeout: TimeInterval) async throws -> SyaiBLEPeripheral {
+        do {
+            return try await central.scanAndConnect(
+                mac: mac, expectedPeripheralID: expectedPeripheralID, scanTimeout: scanTimeout
+            )
+        } catch let SyaiBLECentral.BLEError.disconnected(reason) {
+            throw SyaiPairingService.Failure.droppedAfterConnect(reason)
+        }
+    }
+
+    private func readFirmware(_ peripheral: SyaiBLEPeripheral) async -> (version: String, parseVersion: String) {
+        let versionData = (try? await peripheral.read(SyaiGATT.softVersion)) ?? Data()
+        let versionStr = String(data: versionData, encoding: .utf8) ?? ""
+        let parseVersion = SyaiFrameParser.parseVersion(forDeviceVersion: versionStr)
+        if versionStr.contains("V1.8.") || versionStr.contains("V2.0.") {
+            logger.info("firmware \"\(versionStr)\" is decoded as V1.7 per the vendor profile; first hardware sighting")
+        }
+        return (versionStr, parseVersion)
+    }
+
     private func connectAndAuth(
         mac: String,
         keyGroup: SyaiKeyGroup,
         expectedPeripheralID: UUID?,
         scanTimeout: TimeInterval
     ) async throws -> AuthedLink {
-        let peripheral: SyaiBLEPeripheral
-        do {
-            peripheral = try await central.scanAndConnect(
-                mac: mac, expectedPeripheralID: expectedPeripheralID, scanTimeout: scanTimeout
-            )
-        } catch let SyaiBLECentral.BLEError.disconnected(reason) {
-            throw SyaiPairingService.Failure.droppedAfterConnect(reason)
-        }
+        let peripheral = try await connect(mac: mac, expectedPeripheralID: expectedPeripheralID, scanTimeout: scanTimeout)
 
         let sessionKey: Data
         do {
@@ -153,12 +195,7 @@ public final class SyaiBLE: @unchecked Sendable {
             throw SyaiPairingService.Failure.droppedAfterConnect(error.localizedDescription)
         }
 
-        let versionData = (try? await peripheral.read(SyaiGATT.softVersion)) ?? Data()
-        let versionStr = String(data: versionData, encoding: .utf8) ?? ""
-        let parseVersion = SyaiFrameParser.parseVersion(forDeviceVersion: versionStr)
-        if versionStr.contains("V1.8.") || versionStr.contains("V2.0.") {
-            logger.info("firmware \"\(versionStr)\" is decoded as V1.7 per the vendor profile; first hardware sighting")
-        }
+        let firmware = await readFirmware(peripheral)
 
         do {
             try await peripheral.write(
@@ -178,13 +215,13 @@ public final class SyaiBLE: @unchecked Sendable {
         }
         logger
             .info(
-                "authenticated. mac=\(SyaiRedact.mac(mac)) fw=\"\(versionStr)\" parseVersion=\(parseVersion) cmdState=\(cmdState.map(String.init) ?? "unread")"
+                "authenticated. mac=\(SyaiRedact.mac(mac)) fw=\"\(firmware.version)\" parseVersion=\(firmware.parseVersion) cmdState=\(cmdState.map(String.init) ?? "unread")"
             )
         return AuthedLink(
             peripheral: peripheral,
             sessionKey: sessionKey,
-            firmwareVersion: versionStr,
-            parseVersion: parseVersion,
+            firmwareVersion: firmware.version,
+            parseVersion: firmware.parseVersion,
             cmdState: cmdState
         )
     }
@@ -192,10 +229,16 @@ public final class SyaiBLE: @unchecked Sendable {
     /// Drops the link to a sensor whose readings can't be decoded, before
     /// anything is written to it.
     private func refuseUnverifiedFirmware(_ link: AuthedLink) throws {
-        guard !SyaiFrameParser.isVerified(parseVersion: link.parseVersion) else { return }
-        logger.error("refusing sensor: firmware \"\(link.firmwareVersion)\" has no verified glucose decode")
-        link.peripheral.disconnect()
-        throw SyaiPairingService.Failure.unsupportedFirmware(link.firmwareVersion)
+        try refuseUnverifiedFirmware(
+            peripheral: link.peripheral, firmwareVersion: link.firmwareVersion, parseVersion: link.parseVersion
+        )
+    }
+
+    private func refuseUnverifiedFirmware(peripheral: SyaiBLEPeripheral, firmwareVersion: String, parseVersion: String) throws {
+        guard !SyaiFrameParser.isVerified(parseVersion: parseVersion) else { return }
+        logger.error("refusing sensor: firmware \"\(firmwareVersion)\" has no verified glucose decode")
+        peripheral.disconnect()
+        throw SyaiPairingService.Failure.unsupportedFirmware(firmwareVersion)
     }
 
     private func makeSession(_ link: AuthedLink, keyGroup: SyaiKeyGroup, cmdState: Int?) -> SyaiSensorSession {
