@@ -6,7 +6,7 @@
 //  Licensed under the MIT License. See LICENSE in the project root.
 //
 
-import HealthKit
+import LoopAlgorithm
 import LoopKitUI
 import SwiftUI
 import SyaiKit
@@ -23,7 +23,7 @@ struct SyaiReadingRow: View {
                 .monospacedDigit()
                 .frame(width: 72, alignment: .leading)
             Text(displayGlucosePreference.format(
-                HKQuantity(unit: .milligramsPerDeciliter, doubleValue: sample.valueMgDL),
+                LoopQuantity(unit: .milligramsPerDeciliter, doubleValue: sample.valueMgDL),
                 includeUnit: false
             ))
                 .font(.body.weight(.semibold))
@@ -32,7 +32,7 @@ struct SyaiReadingRow: View {
                 .frame(width: 48, alignment: .trailing)
             if let rate = sample.rateOfChangeMgDLPerMinute {
                 Text(displayGlucosePreference.formatMinuteRate(
-                    HKQuantity(unit: .milligramsPerDeciliterPerMinute, doubleValue: rate),
+                    LoopQuantity(unit: .milligramsPerDeciliterPerMinute, doubleValue: rate),
                     includeUnit: false
                 ))
                     .foregroundStyle(.secondary)

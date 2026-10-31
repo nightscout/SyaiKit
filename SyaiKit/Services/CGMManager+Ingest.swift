@@ -7,7 +7,7 @@
 //
 
 import Foundation
-import HealthKit
+import LoopAlgorithm
 @preconcurrency import LoopKit
 
 extension SyaiCGMManager {
@@ -198,11 +198,11 @@ extension SyaiCGMManager {
 
         let newSample = NewGlucoseSample(
             date: sample.date,
-            quantity: HKQuantity(unit: .milligramsPerDeciliter, doubleValue: sample.valueMgDL),
+            quantity: LoopQuantity(unit: .milligramsPerDeciliter, doubleValue: sample.valueMgDL),
             condition: loopCondition,
             trend: Self.mapTrend(sample.trend),
             trendRate: sample.rateOfChangeMgDLPerMinute.map {
-                HKQuantity(unit: .milligramsPerDeciliterPerMinute, doubleValue: $0)
+                LoopQuantity(unit: .milligramsPerDeciliterPerMinute, doubleValue: $0)
             },
             isDisplayOnly: false,
             wasUserEntered: false,

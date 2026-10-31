@@ -8,6 +8,7 @@
 
 import Foundation
 import HealthKit
+import LoopAlgorithm
 @preconcurrency import LoopKit
 import os.log
 import UIKit
@@ -177,9 +178,16 @@ public final class SyaiCGMManager: CGMManager, @unchecked Sendable {
 
     public var isInoperable: Bool { state.sensorNeedsReplacement }
 
+    public var inSensorWarmup: Bool {
+        if case .warmup = sensorLifecycle { return true }
+        return false
+    }
+
     public var cgmManagerStatus: CGMManagerStatus {
         CGMManagerStatus(
             hasValidSensorSession: state.mac != nil && !state.sensorNeedsReplacement,
+            inSensorWarmup: inSensorWarmup,
+            isInoperable: isInoperable,
             lastCommunicationDate: state.latestReadingTimestamp,
             device: device
         )
@@ -341,9 +349,7 @@ public final class SyaiCGMManager: CGMManager, @unchecked Sendable {
         completion(.noData)
     }
 
-    public func acknowledgeAlert(alertIdentifier _: Alert.AlertIdentifier, completion: @escaping (Error?) -> Void) {
-        completion(nil)
-    }
+    public func acknowledgeAlert(alertIdentifier _: Alert.AlertIdentifier) async throws {}
 
     public func getSoundBaseURL() -> URL? { nil }
     public func getSounds() -> [Alert.Sound] { [] }
@@ -398,9 +404,9 @@ struct SyaiGlucoseDisplay: GlucoseDisplayable {
         }
     }
 
-    var trendRate: HKQuantity? {
+    var trendRate: LoopQuantity? {
         sample.rateOfChangeMgDLPerMinute.map {
-            HKQuantity(unit: .milligramsPerDeciliterPerMinute, doubleValue: $0)
+            LoopQuantity(unit: .milligramsPerDeciliterPerMinute, doubleValue: $0)
         }
     }
 }

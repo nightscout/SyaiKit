@@ -6,7 +6,7 @@
 //  Licensed under the MIT License. See LICENSE in the project root.
 //
 
-import HealthKit
+import LoopAlgorithm
 import LoopKitUI
 import SwiftUI
 import SyaiKit
@@ -21,7 +21,7 @@ struct SyaiSampleDetailView: View {
         List {
             Section {
                 row(String(localized: "Value", comment: "sample detail: glucose value"), value: displayGlucosePreference.format(
-                    HKQuantity(unit: .milligramsPerDeciliter, doubleValue: sample.valueMgDL)
+                    LoopQuantity(unit: .milligramsPerDeciliter, doubleValue: sample.valueMgDL)
                 ))
                 row(
                     String(localized: "Time", comment: "sample detail: time"),
@@ -36,7 +36,7 @@ struct SyaiSampleDetailView: View {
                     row(
                         String(localized: "Rate of change", comment: "sample detail: rate of change"),
                         value: displayGlucosePreference.formatMinuteRate(
-                            HKQuantity(unit: .milligramsPerDeciliterPerMinute, doubleValue: rate)
+                            LoopQuantity(unit: .milligramsPerDeciliterPerMinute, doubleValue: rate)
                         )
                     )
                 } else {
@@ -96,7 +96,7 @@ struct SyaiSampleDetailView: View {
                     row(
                         String(localized: "Raw base", comment: "sample detail: raw base before range clamp"),
                         value: displayGlucosePreference.format(
-                            HKQuantity(unit: .milligramsPerDeciliter, doubleValue: sample.rawBaseMgDL)
+                            LoopQuantity(unit: .milligramsPerDeciliter, doubleValue: sample.rawBaseMgDL)
                         )
                     )
                 }

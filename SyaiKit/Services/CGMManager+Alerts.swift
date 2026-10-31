@@ -17,11 +17,14 @@ extension SyaiCGMManager {
         firingAlertConditions = shouldFire
         delegateQueue?.async { [weak self] in
             guard let self else { return }
-            for condition in issuing {
-                self.cgmManagerDelegate?.issueAlert(condition.alert(managerIdentifier: Self.pluginIdentifier))
-            }
-            for condition in retracting {
-                self.cgmManagerDelegate?.retractAlert(identifier: condition.identifier(managerIdentifier: Self.pluginIdentifier))
+            let delegate = self.cgmManagerDelegate
+            Task {
+                for condition in issuing {
+                    await delegate?.issueAlert(condition.alert(managerIdentifier: Self.pluginIdentifier))
+                }
+                for condition in retracting {
+                    await delegate?.retractAlert(identifier: condition.identifier(managerIdentifier: Self.pluginIdentifier))
+                }
             }
         }
     }
