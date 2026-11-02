@@ -7,7 +7,6 @@
 //
 
 import Foundation
-import LoopAlgorithm
 @preconcurrency import LoopKit
 
 extension SyaiCGMManager {

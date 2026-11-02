@@ -4,9 +4,7 @@
 """Generate SyaiKit.xcodeproj/project.pbxproj (objectVersion 77, Xcode 16
 synchronized folder groups). Four targets (SyaiKit / SyaiKitUI /
 SyaiKitPlugin / SyaiKitTests). LoopKit/LoopKitUI come from BUILT_PRODUCTS_DIR
-(i.e. build inside the Trio workspace). Trio's LoopKit bundles the
-LoopAlgorithm sources, so there is no standalone LoopAlgorithm.framework to
-link."""
+(i.e. build inside the Trio workspace)."""
 
 import itertools
 

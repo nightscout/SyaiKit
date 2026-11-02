@@ -6,7 +6,7 @@
 //  Licensed under the MIT License. See LICENSE in the project root.
 //
 
-import LoopAlgorithm
+import LoopKit
 import LoopKitUI
 import SwiftUI
 import SyaiKit

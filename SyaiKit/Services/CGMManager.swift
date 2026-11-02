@@ -8,7 +8,6 @@
 
 import Foundation
 import HealthKit
-import LoopAlgorithm
 @preconcurrency import LoopKit
 import os.log
 import UIKit
