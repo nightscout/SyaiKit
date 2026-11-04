@@ -187,16 +187,15 @@ final class SyaiUIController: UINavigationController, CGMManagerOnboarding, Comp
                     guard let self else { return }
                     // Leaves the account session alone - only an explicit Log Out
                     // clears it - so re-adding a CGM under the same account needs
-                    // no fresh sign-in. Uses delete(), not notifyDelegateOfDeletion:
-                    // the latter only fires cgmManagerWantsDeletion, and Trio's
+                    // no fresh sign-in. Uses delete(), not cgmManagerWantsDeletion:
+                    // the latter only notifies the host, and Trio's
                     // deleteGlucoseSource just drops the manager without tearing
                     // down the BLE link. delete() does both the teardown and the
                     // notification.
-                    self.cgmManager.delete {
-                        DispatchQueue.main.async { [weak self] in
-                            guard let self else { return }
-                            self.completionDelegate?.completionNotifyingDidComplete(self)
-                        }
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        await self.cgmManager.delete()
+                        self.completionDelegate?.completionNotifyingDidComplete(self)
                     }
                 },
                 showSensorHistory: { [weak self] in self?.navigateTo(.sensorHistory) },

@@ -318,7 +318,7 @@ public final class SyaiCGMManager: CGMManager, @unchecked Sendable {
         setState(blank)
     }
 
-    public func delete(completion: @escaping () -> Void) {
+    public func delete() async {
         isDeleted = true
         Task { @MainActor in self.cancelReconnect() }
         logger.info("cgm delete: releasing BLE link")
@@ -328,11 +328,7 @@ public final class SyaiCGMManager: CGMManager, @unchecked Sendable {
             Task { @MainActor in self.stopSimulation() }
         #endif
 
-        guard delegateQueue != nil else {
-            completion()
-            return
-        }
-        notifyDelegateOfDeletion(completion: completion)
+        await cgmManagerDelegate?.cgmManagerWantsDeletion(self)
     }
 
     public func fetchNewDataIfNeeded(_ completion: @escaping (CGMReadingResult) -> Void) {
