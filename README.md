@@ -48,6 +48,19 @@ replaced.
 
 A: No. The sensor can only talk to one device at a time. It is not possible to run the Syai app along side Trio.
 
+**Q: Nightscout shows readings during warmup (often very high), or every reading twice. Is that a bug?**
+
+A: Not in SyaiKit. Trio never forwards warmup readings, so these come from Syai.
+If you linked Nightscout in the Syai Tag app, Syai's servers upload every
+reading Trio shares with them, including warmup. Use one Nightscout uploader,
+not both:
+
+- Recommended: remove the Nightscout link in the Syai Tag app. Trio keeps
+  uploading glucose along with everything else it sends, without warmup
+  readings.
+- Or turn off "Upload Glucose" in Trio's Nightscout settings. Syai becomes the
+  only glucose uploader, but warmup readings will still appear.
+
 ## More Information
 
 For more information please join the Trio Discord: https://discord.triodocs.org/
